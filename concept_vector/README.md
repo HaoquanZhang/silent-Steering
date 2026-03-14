@@ -25,6 +25,10 @@ These are directly loadable by `glp/script_introspection_offmanifold.py`.
 
 ## Run
 
+Run from the repository root. You can use either:
+- `python concept_vector/extract_concept_vectors.py ...`
+- `python -m concept_vector.extract_concept_vectors ...`
+
 ### Llama-3.1-8B
 ```bash
 python concept_vector/extract_concept_vectors.py \
@@ -44,6 +48,23 @@ python concept_vector/extract_concept_vectors.py \
   --dtype bfloat16 \
   --batch_size 16
 ```
+
+
+### Multi-GPU hidden-state extraction
+Yes—use HuggingFace sharding with `--device_map auto` (and set visible GPUs):
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1,2,3 python concept_vector/extract_concept_vectors.py \
+  --model meta-llama/Llama-3.1-8B \
+  --output_dir concept_vector/outputs \
+  --device_map auto \
+  --dtype bfloat16 \
+  --batch_size 8
+```
+
+Notes:
+- `--device_map auto` spreads model layers across available GPUs and can reduce per-GPU memory pressure.
+- If you want single-GPU placement, keep `--device_map none --device cuda:0`.
 
 ### Optional single-layer export
 ```bash

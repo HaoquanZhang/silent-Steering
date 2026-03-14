@@ -13,7 +13,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import torch
 from tqdm import tqdm
@@ -28,7 +34,14 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Extract concept vectors from Llama models")
     p.add_argument("--model", type=str, required=True, help="HF model id or local path")
     p.add_argument("--output_dir", type=str, required=True)
-    p.add_argument("--device", type=str, default="cuda")
+    p.add_argument("--device", type=str, default="cuda:0", help="Single-device target when device_map=none")
+    p.add_argument(
+        "--device_map",
+        type=str,
+        default="none",
+        choices=["none", "auto", "balanced", "balanced_low_0", "sequential"],
+        help="HF multi-GPU sharding strategy. Use 'auto' to spread model across visible GPUs.",
+    )
     p.add_argument("--dtype", type=str, default="bfloat16", choices=["float16", "bfloat16", "float32"])
     p.add_argument("--batch_size", type=int, default=8)
     p.add_argument("--normalize", type=str, default="none", choices=["none", "l2"])
@@ -64,6 +77,21 @@ def normalize_tensor(x: torch.Tensor, mode: str) -> torch.Tensor:
     raise ValueError(mode)
 
 
+def get_model_input_device(model: AutoModelForCausalLM) -> torch.device | None:
+    """Return device where input_ids should live, or None to keep on CPU for sharded models."""
+    hf_map = getattr(model, "hf_device_map", None)
+    if hf_map:
+        # For accelerate-sharded models, passing CPU tensors lets hooks route tensors correctly.
+        return None
+    return next(model.parameters()).device
+
+
+def _to_device(batch: dict[str, torch.Tensor], device: torch.device | None) -> dict[str, torch.Tensor]:
+    if device is None:
+        return batch
+    return {k: v.to(device) for k, v in batch.items()}
+
+
 def compute_hidden_stack(
     model: AutoModelForCausalLM,
     tokenizer: AutoTokenizer,
@@ -71,32 +99,42 @@ def compute_hidden_stack(
     batch_size: int,
 ) -> dict[str, torch.Tensor]:
     """Return mapping word -> tensor [num_layers, hidden_size]."""
+    input_device = get_model_input_device(model)
     result: dict[str, torch.Tensor] = {}
     for i in tqdm(range(0, len(words), batch_size), desc="forward"):
         batch_words = words[i : i + batch_size]
         texts = [prompt_for(w) for w in batch_words]
         enc = tokenizer(texts, return_tensors="pt", padding=True)
-        input_ids = enc["input_ids"].to(model.device)
-        attention_mask = enc["attention_mask"].to(model.device)
+        enc = _to_device(enc, input_device)
+        attention_mask = enc["attention_mask"]
 
         with torch.no_grad():
-            out = model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True)
+            out = model(**enc, output_hidden_states=True)
 
         hidden_states = out.hidden_states[1:]
-        # final prompt token index per item (should be final ':' token in Assistant:)
         token_positions = attention_mask.sum(dim=1) - 1
 
         for b_idx, word in enumerate(batch_words):
             pos = int(token_positions[b_idx].item())
-            # Gather layer stack at position: [num_layers, hidden_size]
             layers = [h[b_idx, pos, :].float().cpu() for h in hidden_states]
             result[word] = torch.stack(layers, dim=0)
     return result
 
 
-def save_metadata(path: Path, metadata: dict) -> None:
+def save_metadata(path: Path, metadata: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+
+def load_model(args: argparse.Namespace, dtype: torch.dtype) -> AutoModelForCausalLM:
+    kwargs: dict[str, Any] = {"torch_dtype": dtype}
+    if args.device_map != "none":
+        kwargs["device_map"] = args.device_map
+    model = AutoModelForCausalLM.from_pretrained(args.model, **kwargs)
+    if args.device_map == "none":
+        model.to(args.device)
+    model.eval()
+    return model
 
 
 def main() -> None:
@@ -109,12 +147,7 @@ def main() -> None:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    model = AutoModelForCausalLM.from_pretrained(
-        args.model,
-        torch_dtype=dtype,
-    )
-    model.to(args.device)
-    model.eval()
+    model = load_model(args, dtype)
 
     baseline_words = BASELINE_WORDS_100.copy()
     concept_words = CONCEPT_WORDS_50.copy()
@@ -125,20 +158,18 @@ def main() -> None:
     all_words = sorted(set(baseline_words + concept_words))
     hidden = compute_hidden_stack(model, tokenizer, all_words, batch_size=args.batch_size)
 
-    baseline_tensor = torch.stack([hidden[w] for w in baseline_words], dim=0)  # [B, L, H]
-    baseline_mean = baseline_tensor.mean(dim=0)  # [L, H]
+    baseline_tensor = torch.stack([hidden[w] for w in baseline_words], dim=0)
+    baseline_mean = baseline_tensor.mean(dim=0)
 
     model_name = Path(str(args.model).rstrip("/")).name
     model_out = output_dir / model_name
     model_out.mkdir(parents=True, exist_ok=True)
 
     for word in concept_words:
-        vec = hidden[word] - baseline_mean  # [L, H]
+        vec = hidden[word] - baseline_mean
         vec = normalize_tensor(vec, args.normalize)
 
-        tensor_path = model_out / f"{word}_response_avg_diff.pt"
-        torch.save(vec, tensor_path)
-
+        torch.save(vec, model_out / f"{word}_response_avg_diff.pt")
         if args.export_layer_idx is not None:
             layer_vec = vec[args.export_layer_idx]
             torch.save(layer_vec, model_out / f"{word}_layer{args.export_layer_idx:02d}_response_avg_diff.pt")
@@ -155,6 +186,8 @@ def main() -> None:
             "hidden_size": int(vec.shape[1]),
             "normalize": args.normalize,
             "dtype": str(vec.dtype),
+            "device": args.device,
+            "device_map": args.device_map,
             "baseline_words_count": len(baseline_words),
             "baseline_words_sha256_16": baseline_hash(),
             "compatible_with": ["off-mani.sh", "glp/script_introspection_offmanifold.py"],
